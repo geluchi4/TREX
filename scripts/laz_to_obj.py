@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Convierte un fichero LAZ/LAS a OBJ con malla 3D.
-Uso: python3 laz_to_obj.py fichero.laz [salida.obj]
+Uso: python laz_to_obj.py fichero.laz [salida.obj]
+Requiere: pip install laspy[lazrs] numpy scipy
 """
 
 import sys
 import numpy as np
 import laspy
-import open3d as o3d
+from scipy.spatial import Delaunay
 
 def laz_to_obj(input_path, output_path=None):
     if output_path is None:
@@ -31,48 +32,48 @@ def laz_to_obj(input_path, output_path=None):
     y -= cy
     z -= cz
 
-    print("[2/4] Creando nube de puntos...")
-    points = np.stack([x, y, z], axis=-1).astype(np.float64)
+    # Submuestrear si hay demasiados puntos (Delaunay es lento con >500k)
+    MAX_POINTS = 500_000
+    if len(x) > MAX_POINTS:
+        print(f"[2/4] Submuestreando a {MAX_POINTS:,} puntos...")
+        idx = np.random.choice(len(x), MAX_POINTS, replace=False)
+        x, y, z = x[idx], y[idx], z[idx]
+    else:
+        print(f"[2/4] Preparando {len(x):,} puntos...")
 
-    # Submuestrear si hay demasiados puntos (>5M puede ser lento)
-    if len(points) > 5_000_000:
-        print(f"      Demasiados puntos, submuestreando a 5M...")
-        idx = np.random.choice(len(points), 5_000_000, replace=False)
-        points = points[idx]
+    print("[3/4] Triangulando (puede tardar unos minutos)...")
+    # Delaunay 2D sobre XY, usando Z como altura
+    tri = Delaunay(np.stack([x, y], axis=-1))
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-
-    print("[3/4] Calculando normales y generando malla (esto puede tardar unos minutos)...")
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30)
+    # Filtrar triángulos muy grandes (ruido en bordes)
+    pts = np.stack([x, y, z], axis=-1)
+    simplices = tri.simplices
+    v0 = pts[simplices[:, 0]]
+    v1 = pts[simplices[:, 1]]
+    v2 = pts[simplices[:, 2]]
+    edge_max = np.maximum(
+        np.linalg.norm(v1 - v0, axis=1),
+        np.maximum(np.linalg.norm(v2 - v1, axis=1), np.linalg.norm(v0 - v2, axis=1))
     )
-    pcd.orient_normals_consistent_tangent_plane(30)
-
-    # Reconstrucción de superficie con Poisson
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=10, width=0, scale=1.1, linear_fit=False
-    )
-
-    # Eliminar triángulos con baja densidad (bordes ruidosos)
-    densities = np.asarray(densities)
-    threshold = np.percentile(densities, 10)
-    vertices_to_remove = densities < threshold
-    mesh.remove_vertices_by_mask(vertices_to_remove)
-    mesh.compute_vertex_normals()
+    threshold = np.percentile(edge_max, 95)
+    simplices = simplices[edge_max < threshold]
 
     print(f"[4/4] Guardando {output_path}...")
-    o3d.io.write_triangle_mesh(output_path, mesh)
+    with open(output_path, "w") as f:
+        f.write("# OBJ generado desde LiDAR LAZ\n")
+        for px, py, pz in zip(x, y, z):
+            f.write(f"v {px:.3f} {py:.3f} {pz:.3f}\n")
+        for tri_idx in simplices:
+            # OBJ usa índices base 1
+            f.write(f"f {tri_idx[0]+1} {tri_idx[1]+1} {tri_idx[2]+1}\n")
 
-    verts = np.asarray(mesh.vertices)
-    tris = np.asarray(mesh.triangles)
-    print(f"      Vertices: {len(verts):,}")
-    print(f"      Triangulos: {len(tris):,}")
+    print(f"      Vertices: {len(x):,}")
+    print(f"      Triangulos: {len(simplices):,}")
     print(f"\n✓ Fichero guardado: {output_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Uso: python3 laz_to_obj.py fichero.laz [salida.obj]")
+        print("Uso: python laz_to_obj.py fichero.laz [salida.obj]")
         sys.exit(1)
 
     entrada = sys.argv[1]
