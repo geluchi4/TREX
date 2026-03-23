@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convierte un fichero LAZ/LAS a OBJ con textura PNG real.
+Convierte un fichero LAZ/LAS a OBJ con textura PNG real (proyeccion cenital).
 Genera 3 ficheros: .obj + .mtl + .png
 Uso: python laz_to_obj.py fichero.laz [salida.obj]
 Requiere: pip install laspy[lazrs] numpy scipy pillow
@@ -13,6 +13,8 @@ import laspy
 from scipy.spatial import Delaunay
 from PIL import Image
 
+TEX_SIZE = 2048  # Resolución de la textura (2048x2048)
+
 def laz_to_obj(input_path, output_path=None):
     if output_path is None:
         output_path = input_path.rsplit(".", 1)[0] + ".obj"
@@ -20,6 +22,7 @@ def laz_to_obj(input_path, output_path=None):
     mtl_path = base + ".mtl"
     tex_path = base + ".png"
     tex_name = tex_path.split("\\")[-1].split("/")[-1]
+    mtl_name = base.split("\\")[-1].split("/")[-1] + ".mtl"
 
     print(f"[1/5] Leyendo {input_path}...")
     las = laspy.read(input_path)
@@ -44,6 +47,11 @@ def laz_to_obj(input_path, output_path=None):
 
     print(f"      {len(x):,} puntos cargados")
 
+    # Guardar rango original para UV
+    x_min, x_max = x.min(), x.max()
+    y_min, y_max = y.min(), y.max()
+
+    # Centrar en origen
     cx, cy, cz = x.mean(), y.mean(), z.min()
     x -= cx
     y -= cy
@@ -56,8 +64,12 @@ def laz_to_obj(input_path, output_path=None):
         x, y, z = x[idx], y[idx], z[idx]
         if has_color:
             r, g, b = r[idx], g[idx], b[idx]
+        x_orig = np.array(las.x)[idx]
+        y_orig = np.array(las.y)[idx]
     else:
         print(f"[2/5] Preparando {len(x):,} puntos...")
+        x_orig = np.array(las.x)
+        y_orig = np.array(las.y)
 
     if not has_color:
         z_norm = (z - z.min()) / (z.max() - z.min() + 1e-6)
@@ -79,53 +91,50 @@ def laz_to_obj(input_path, output_path=None):
     threshold = np.percentile(edge_max, 95)
     simplices = simplices[edge_max < threshold]
 
-    print("[4/5] Generando textura PNG...")
-    n = len(x)
-    tex_w = math.ceil(math.sqrt(n))
-    tex_h = math.ceil(n / tex_w)
-    pixels = np.zeros((tex_h, tex_w, 3), dtype=np.uint8)
+    print("[4/5] Generando textura cenital PNG...")
+    # UV basado en posición real X/Y -> píxel en textura
+    x_range = x_max - x_min + 1e-6
+    y_range = y_max - y_min + 1e-6
+    u = (x_orig - x_min) / x_range          # 0..1
+    v_uv = 1.0 - (y_orig - y_min) / y_range  # 0..1 (invertir Y)
+
+    # Crear imagen
+    pixels = np.zeros((TEX_SIZE, TEX_SIZE, 3), dtype=np.uint8)
+    px_col = (u * (TEX_SIZE - 1)).astype(np.int32)
+    px_row = (v_uv * (TEX_SIZE - 1)).astype(np.int32)
     ri = (np.clip(r, 0, 1) * 255).astype(np.uint8)
     gi = (np.clip(g, 0, 1) * 255).astype(np.uint8)
     bi = (np.clip(b, 0, 1) * 255).astype(np.uint8)
-    for i in range(n):
-        row = i // tex_w
-        col = i % tex_w
-        pixels[row, col] = [ri[i], gi[i], bi[i]]
+    pixels[px_row, px_col, 0] = ri
+    pixels[px_row, px_col, 1] = gi
+    pixels[px_row, px_col, 2] = bi
     img = Image.fromarray(pixels, "RGB")
     img.save(tex_path)
 
-    # UV coords: centro del pixel para cada vértice
-    u = ((np.arange(n) % tex_w) + 0.5) / tex_w
-    v_uv = ((np.arange(n) // tex_w) + 0.5) / tex_h
-
     print(f"[5/5] Guardando OBJ + MTL...")
 
-    # MTL
     with open(mtl_path, "w") as f:
-        f.write(f"newmtl lidar_tex\n")
-        f.write(f"Ka 1.0 1.0 1.0\n")
-        f.write(f"Kd 1.0 1.0 1.0\n")
+        f.write("newmtl lidar_tex\n")
+        f.write("Ka 1.0 1.0 1.0\n")
+        f.write("Kd 1.0 1.0 1.0\n")
         f.write(f"map_Kd {tex_name}\n")
 
-    # OBJ
+    n = len(x)
     with open(output_path, "w") as f:
-        f.write(f"mtllib {base.split(chr(92))[-1].split('/')[-1]}.mtl\n")
-        f.write("# Vertices\n")
+        f.write(f"mtllib {mtl_name}\n")
         for i in range(n):
             f.write(f"v {x[i]:.3f} {y[i]:.3f} {z[i]:.3f}\n")
-        f.write("# UV coords\n")
         for i in range(n):
             f.write(f"vt {u[i]:.6f} {v_uv[i]:.6f}\n")
         f.write("usemtl lidar_tex\n")
-        f.write("# Caras\n")
         for tri_idx in simplices:
             a, b_, c = tri_idx[0]+1, tri_idx[1]+1, tri_idx[2]+1
             f.write(f"f {a}/{a} {b_}/{b_} {c}/{c}\n")
 
-    print(f"      Vertices:    {n:,}")
-    print(f"      Triangulos:  {len(simplices):,}")
-    print(f"      Textura:     {tex_w}x{tex_h} px")
-    print(f"      Color:       {'RGB real' if has_color else 'por altura'}")
+    print(f"      Vertices:   {n:,}")
+    print(f"      Triangulos: {len(simplices):,}")
+    print(f"      Textura:    {TEX_SIZE}x{TEX_SIZE} px")
+    print(f"      Color:      {'RGB real' if has_color else 'por altura'}")
     print(f"\n✓ Ficheros generados:")
     print(f"  - {output_path}")
     print(f"  - {mtl_path}")
